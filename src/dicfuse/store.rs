@@ -1105,6 +1105,77 @@ impl DictionaryStore {
         }
     }
 
+    /// Wait until a user-visible path is traversable from the mount root.
+    ///
+    /// This is stronger than `wait_for_ready()`: it actively walks ancestors,
+    /// refreshes unloaded directories, and only returns once the requested path
+    /// is reachable in the current store view.
+    pub async fn wait_for_path_ready(
+        &self,
+        path: &str,
+        timeout: Duration,
+        poll_interval: Duration,
+    ) -> io::Result<u64> {
+        let deadline = Instant::now() + timeout;
+        let normalized = Self::normalize_user_path(path);
+        loop {
+            match self.ensure_path_traversable(&normalized).await {
+                Ok(inode) => return Ok(inode),
+                Err(err) => {
+                    if Instant::now() >= deadline {
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            format!(
+                                "Timed out waiting for path {normalized:?} to become ready: {err}"
+                            ),
+                        ));
+                    }
+                    tokio::time::sleep(poll_interval).await;
+                }
+            }
+        }
+    }
+
+    async fn ensure_path_traversable(&self, path: &str) -> io::Result<u64> {
+        self.wait_for_ready().await;
+
+        let normalized = Self::normalize_user_path(path);
+        let mut current_inode = 1;
+
+        self.ensure_dir_loaded(current_inode).await?;
+        if normalized == "/" {
+            return Ok(current_inode);
+        }
+
+        let mut current_path = String::new();
+        for segment in normalized
+            .trim_start_matches('/')
+            .split('/')
+            .filter(|segment| !segment.is_empty())
+        {
+            current_path.push('/');
+            current_path.push_str(segment);
+
+            current_inode = self.get_inode_from_path(&current_path).await.map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("path component {current_path:?} is not available yet"),
+                )
+            })?;
+
+            if self
+                .persistent_path_store
+                .get_item(current_inode)
+                .map(|item| item.is_dir())
+                .unwrap_or(false)
+            {
+                self.ensure_dir_loaded(current_inode).await?;
+            }
+        }
+
+        Ok(current_inode)
+    }
+
     fn dir_lock_for_path(&self, user_path: &str) -> Arc<Mutex<()>> {
         self.dir_locks
             .entry(user_path.to_string())
@@ -1470,16 +1541,16 @@ impl DictionaryStore {
     async fn load_dirs(&self, path: PathBuf, parent_inode: u64) -> Result<(), io::Error> {
         let root_item = self.persistent_path_store.get_item(parent_inode)?;
         let children = root_item.get_children();
-        // If the directory exists in our persisted path store, treat it as "loaded".
-        // Even for empty directories, this avoids re-fetching on first access after restart.
-        let loaded = true;
+        // Recovered directories are only a cache hint. Do not restore them as
+        // freshly loaded, or callers may observe stale negative lookups before
+        // the first real refresh repopulates the children.
         self.dirs.insert(
             path.to_string_lossy().to_string(),
             DirItem {
                 hash: root_item.hash.to_owned(),
                 file_list: HashMap::new(),
-                loaded,
-                last_sync: Some(Instant::now()),
+                loaded: false,
+                last_sync: None,
             },
         );
         for child in children {
@@ -2905,6 +2976,81 @@ mod tests {
 
         let status = store.lookup_path_status("/repo/missing").await.unwrap();
         assert_eq!(status, PathLookupStatus::NotFound);
+    }
+
+    #[tokio::test]
+    async fn test_wait_for_path_ready_returns_inode_for_existing_path() {
+        use tempfile::tempdir;
+
+        let tmp = tempdir().unwrap();
+        let store = DictionaryStore::new_with_store_path(tmp.path().to_str().unwrap()).await;
+
+        store.insert_mock_item(1, 0, "", true).await;
+        store.insert_mock_item(2, 1, "repo", true).await;
+        store.insert_mock_item(3, 2, ".buckconfig", false).await;
+
+        store.ready.store(true, Ordering::Release);
+
+        ensure_dir_tracked(&store.dirs, "/");
+        if let Some(mut dir) = store.dirs.get_mut("/") {
+            dir.loaded = true;
+            dir.last_sync = Some(Instant::now());
+            dir.file_list.insert("/repo".to_string(), false);
+        }
+
+        ensure_dir_tracked(&store.dirs, "/repo");
+        if let Some(mut dir) = store.dirs.get_mut("/repo") {
+            dir.loaded = true;
+            dir.last_sync = Some(Instant::now());
+            dir.file_list.insert("/repo/.buckconfig".to_string(), false);
+        }
+
+        let inode = store
+            .wait_for_path_ready(
+                "/repo/.buckconfig",
+                Duration::from_millis(50),
+                Duration::from_millis(5),
+            )
+            .await
+            .unwrap();
+        assert_eq!(inode, 3);
+    }
+
+    #[tokio::test]
+    async fn test_wait_for_path_ready_times_out_for_missing_path() {
+        use tempfile::tempdir;
+
+        let tmp = tempdir().unwrap();
+        let store = DictionaryStore::new_with_store_path(tmp.path().to_str().unwrap()).await;
+
+        store.insert_mock_item(1, 0, "", true).await;
+        store.insert_mock_item(2, 1, "repo", true).await;
+
+        store.ready.store(true, Ordering::Release);
+
+        ensure_dir_tracked(&store.dirs, "/");
+        if let Some(mut dir) = store.dirs.get_mut("/") {
+            dir.loaded = true;
+            dir.last_sync = Some(Instant::now());
+            dir.file_list.insert("/repo".to_string(), false);
+        }
+
+        ensure_dir_tracked(&store.dirs, "/repo");
+        if let Some(mut dir) = store.dirs.get_mut("/repo") {
+            dir.loaded = true;
+            dir.last_sync = Some(Instant::now());
+        }
+
+        let err = store
+            .wait_for_path_ready(
+                "/repo/missing",
+                Duration::from_millis(20),
+                Duration::from_millis(5),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert!(err.to_string().contains("Timed out waiting for path"));
     }
 
     /// Helper function to create a DictionaryStore with base_path for testing.

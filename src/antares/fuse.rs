@@ -104,7 +104,8 @@ impl AntaresFuse {
                 Ok(()) => tracing::debug!("FUSE session ended normally for {}", mp_display),
                 Err(e) => tracing::error!(
                     "FUSE session died for {}: {} — clients will see ENOTCONN",
-                    mp_display, e,
+                    mp_display,
+                    e,
                 ),
             }
         });

@@ -1043,7 +1043,7 @@ impl AntaresServiceImpl {
             );
             match tokio::time::timeout(
                 Duration::from_secs(INIT_TIMEOUT_SECS),
-                self.dicfuse.store.wait_for_ready(),
+                self.dicfuse.store.wait_for_path_ready("/", Duration::from_secs(INIT_TIMEOUT_SECS), Duration::from_millis(100)),
             )
             .await
             {
@@ -1096,7 +1096,7 @@ impl AntaresServiceImpl {
         );
         match tokio::time::timeout(
             std::time::Duration::from_secs(INIT_TIMEOUT_SECS),
-            new_dicfuse.store.wait_for_ready(),
+            new_dicfuse.store.wait_for_path_ready("/", Duration::from_secs(INIT_TIMEOUT_SECS), Duration::from_millis(100)),
         )
         .await
         {
@@ -1501,9 +1501,10 @@ impl AntaresService for AntaresServiceImpl {
                 if let Some(c) = cl_dir_str.as_deref() {
                     let _ = std::fs::remove_dir_all(c);
                 }
-                return Err(ServiceError::FuseFailure(
-                    format!("mount probe failed on {}: {}", mountpoint_str, e),
-                ));
+                return Err(ServiceError::FuseFailure(format!(
+                    "mount probe failed on {}: {}",
+                    mountpoint_str, e
+                )));
             }
         }
 
@@ -2710,7 +2711,10 @@ mod tests {
                 mount_id,
                 ready: status.state == MountLifecycle::Ready,
                 state: status.state.clone(),
-                fuse_alive: matches!(status.state, MountLifecycle::Mounted | MountLifecycle::Ready),
+                fuse_alive: matches!(
+                    status.state,
+                    MountLifecycle::Mounted | MountLifecycle::Ready
+                ),
             })
         }
 
