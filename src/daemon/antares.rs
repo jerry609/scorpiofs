@@ -446,6 +446,9 @@ pub struct MountReadyResponse {
     pub ready: bool,
     /// Current lifecycle state of the mount.
     pub state: MountLifecycle,
+    /// `true` when the FUSE background task is still running.
+    /// `false` means the session has died and clients will see ENOTCONN.
+    pub fuse_alive: bool,
 }
 
 /// Health check response payload.
@@ -1480,6 +1483,30 @@ impl AntaresService for AntaresServiceImpl {
             .await
             .map_err(|e| ServiceError::FuseFailure(format!("failed to mount: {}", e)))?;
 
+        // 7b. Probe the mountpoint to confirm the FUSE session is actually responding.
+        // This catches immediate session death (ENOTCONN) before we report Ready.
+        let mp_path = std::path::Path::new(&mountpoint_str);
+        match tokio::fs::metadata(mp_path).await {
+            Ok(_) => {}
+            Err(e) => {
+                tracing::error!(
+                    mount_id = %mount_id,
+                    mountpoint = %mountpoint_str,
+                    error = %e,
+                    "post-mount probe failed; FUSE session is not responding"
+                );
+                fuse.unmount().await.ok();
+                let _ = std::fs::remove_dir_all(&mountpoint_str);
+                let _ = std::fs::remove_dir_all(&upper_dir_str);
+                if let Some(c) = cl_dir_str.as_deref() {
+                    let _ = std::fs::remove_dir_all(c);
+                }
+                return Err(ServiceError::FuseFailure(
+                    format!("mount probe failed on {}: {}", mountpoint_str, e),
+                ));
+            }
+        }
+
         // 8. Record timestamps. We'll only construct MountEntry after passing the duplicate check
         // so we can rollback the FUSE mount safely on race losers.
         let now = current_epoch_ms();
@@ -2102,15 +2129,25 @@ impl AntaresService for AntaresServiceImpl {
     }
 
     async fn check_mount_ready(&self, mount_id: Uuid) -> Result<MountReadyResponse, ServiceError> {
-        let mounts = self.mounts.read().await;
+        let mut mounts = self.mounts.write().await;
         let entry = mounts
-            .get(&mount_id)
+            .get_mut(&mount_id)
             .ok_or(ServiceError::NotFound(mount_id))?;
+        let fuse_alive = entry.fuse.is_session_alive();
+        // Auto-detect FUSE session death: if the background task has finished
+        // while the mount is supposedly healthy, transition to Failed so callers
+        // learn about the broken mount instead of seeing a stale Ready.
+        if !fuse_alive && matches!(entry.state, MountLifecycle::Mounted | MountLifecycle::Ready) {
+            entry.state = MountLifecycle::Failed {
+                reason: "FUSE session died unexpectedly".into(),
+            };
+        }
         let ready = entry.state == MountLifecycle::Ready;
         Ok(MountReadyResponse {
             mount_id,
             ready,
             state: entry.state.clone(),
+            fuse_alive,
         })
     }
 
@@ -2673,6 +2710,7 @@ mod tests {
                 mount_id,
                 ready: status.state == MountLifecycle::Ready,
                 state: status.state.clone(),
+                fuse_alive: matches!(status.state, MountLifecycle::Mounted | MountLifecycle::Ready),
             })
         }
 
