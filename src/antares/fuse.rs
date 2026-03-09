@@ -97,10 +97,18 @@ impl AntaresFuse {
         let handle =
             mount_filesystem_with_antares_cache(logfs, self.mountpoint.as_os_str(), true).await;
 
-        // Spawn background task to run the FUSE session
+        // Spawn background task to run the FUSE session.
+        // Log errors instead of silently discarding — a dying session
+        // causes ENOTCONN for every client I/O until the mount is recycled.
+        let mp_display = self.mountpoint.display().to_string();
         let fuse_task = tokio::spawn(async move {
-            // This will block until unmount is called
-            let _ = handle.await;
+            match handle.await {
+                Ok(()) => tracing::debug!("FUSE session ended normally for {}", mp_display),
+                Err(e) => tracing::error!(
+                    "FUSE session died for {}: {} — clients will see ENOTCONN",
+                    mp_display, e,
+                ),
+            }
         });
 
         self.fuse_task = Some(fuse_task);
@@ -140,63 +148,44 @@ impl AntaresFuse {
             )
             .await;
 
-            match graceful {
-                Ok(Ok(output)) if output.status.success() => {}
+            let needs_lazy = match graceful {
+                Ok(Ok(output)) if output.status.success() => false,
                 Ok(Ok(output)) => {
                     tracing::warn!(
                         "fusermount -u failed for {}: {}; falling back to -uz",
                         mount_path,
                         String::from_utf8_lossy(&output.stderr)
                     );
-                    let lazy = tokio::process::Command::new("fusermount")
-                        .arg("-uz")
-                        .arg(&mount_path)
-                        .output()
-                        .await?;
-                    if !lazy.status.success() {
-                        tracing::warn!(
-                            "fusermount -uz failed for {}: {}",
-                            mount_path,
-                            String::from_utf8_lossy(&lazy.stderr)
-                        );
-                    }
+                    true
                 }
                 Ok(Err(e)) => {
                     tracing::warn!(
                         "failed to execute fusermount -u for {}: {}; falling back to -uz",
-                        mount_path,
-                        e
+                        mount_path, e
                     );
-                    let lazy = tokio::process::Command::new("fusermount")
-                        .arg("-uz")
-                        .arg(&mount_path)
-                        .output()
-                        .await?;
-                    if !lazy.status.success() {
-                        tracing::warn!(
-                            "fusermount -uz failed for {}: {}",
-                            mount_path,
-                            String::from_utf8_lossy(&lazy.stderr)
-                        );
-                    }
+                    true
                 }
                 Err(_) => {
                     tracing::warn!(
                         "fusermount -u timed out for {}; falling back to -uz",
                         mount_path
                     );
-                    let lazy = tokio::process::Command::new("fusermount")
-                        .arg("-uz")
-                        .arg(&mount_path)
-                        .output()
-                        .await?;
-                    if !lazy.status.success() {
-                        tracing::warn!(
-                            "fusermount -uz failed for {}: {}",
-                            mount_path,
-                            String::from_utf8_lossy(&lazy.stderr)
-                        );
-                    }
+                    true
+                }
+            };
+
+            if needs_lazy {
+                let lazy = tokio::process::Command::new("fusermount")
+                    .arg("-uz")
+                    .arg(&mount_path)
+                    .output()
+                    .await?;
+                if !lazy.status.success() {
+                    tracing::warn!(
+                        "fusermount -uz failed for {}: {}",
+                        mount_path,
+                        String::from_utf8_lossy(&lazy.stderr)
+                    );
                 }
             }
 
