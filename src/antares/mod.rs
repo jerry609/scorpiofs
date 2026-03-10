@@ -239,7 +239,7 @@ impl AntaresManager {
 
     /// Build an Antares manager backed by an isolated on-disk Dicfuse store.
     pub async fn new_with_store_path(paths: AntaresPaths, store_path: &str) -> Self {
-        let dic = Arc::new(Dicfuse::new_with_store_path(store_path).await);
+        let dic = DicfuseManager::for_base_path_with_store_root(DEFAULT_SOURCE_PATH, store_path).await;
         Self::with_dicfuse(paths, dic, store_path.to_string())
     }
 
