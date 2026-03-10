@@ -209,9 +209,7 @@ pub struct AntaresManager {
 }
 
 impl AntaresManager {
-    /// Build an independent Antares manager with its own Dicfuse instance.
-    pub async fn new(paths: AntaresPaths) -> Self {
-        let dic = DicfuseManager::global().await;
+    fn with_dicfuse(paths: AntaresPaths, dic: Arc<Dicfuse>) -> Self {
         let instances = Self::load_state(&paths.state_file).unwrap_or_default();
         Self {
             dic,
@@ -219,6 +217,23 @@ impl AntaresManager {
             instances: Arc::new(Mutex::new(instances)),
             fuse_handles: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Build an independent Antares manager with its own Dicfuse instance.
+    pub async fn new(paths: AntaresPaths) -> Self {
+        let dic = DicfuseManager::global().await;
+        Self::with_dicfuse(paths, dic)
+    }
+
+    /// Build an Antares manager using a caller-provided Dicfuse instance.
+    pub async fn new_with_dicfuse(paths: AntaresPaths, dic: Arc<Dicfuse>) -> Self {
+        Self::with_dicfuse(paths, dic)
+    }
+
+    /// Build an Antares manager backed by an isolated on-disk Dicfuse store.
+    pub async fn new_with_store_path(paths: AntaresPaths, store_path: &str) -> Self {
+        let dic = Arc::new(Dicfuse::new_with_store_path(store_path).await);
+        Self::with_dicfuse(paths, dic)
     }
 
     /// Mount the monorepo root at an auto-generated mountpoint.
