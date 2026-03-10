@@ -203,16 +203,18 @@ struct AntaresState {
 /// Manager responsible for creating and tracking Antares overlay instances.
 pub struct AntaresManager {
     dic: Arc<Dicfuse>,
+    store_root: String,
     paths: AntaresPaths,
     instances: Arc<Mutex<HashMap<String, AntaresConfig>>>,
     fuse_handles: Arc<Mutex<HashMap<String, AntaresFuse>>>,
 }
 
 impl AntaresManager {
-    fn with_dicfuse(paths: AntaresPaths, dic: Arc<Dicfuse>) -> Self {
+    fn with_dicfuse(paths: AntaresPaths, dic: Arc<Dicfuse>, store_root: String) -> Self {
         let instances = Self::load_state(&paths.state_file).unwrap_or_default();
         Self {
             dic,
+            store_root,
             paths,
             instances: Arc::new(Mutex::new(instances)),
             fuse_handles: Arc::new(Mutex::new(HashMap::new())),
@@ -221,19 +223,24 @@ impl AntaresManager {
 
     /// Build an independent Antares manager with its own Dicfuse instance.
     pub async fn new(paths: AntaresPaths) -> Self {
+        let store_root = config::store_path().to_string();
         let dic = DicfuseManager::global().await;
-        Self::with_dicfuse(paths, dic)
+        Self::with_dicfuse(paths, dic, store_root)
     }
 
     /// Build an Antares manager using a caller-provided Dicfuse instance.
-    pub async fn new_with_dicfuse(paths: AntaresPaths, dic: Arc<Dicfuse>) -> Self {
-        Self::with_dicfuse(paths, dic)
+    pub async fn new_with_dicfuse(
+        paths: AntaresPaths,
+        dic: Arc<Dicfuse>,
+        store_root: String,
+    ) -> Self {
+        Self::with_dicfuse(paths, dic, store_root)
     }
 
     /// Build an Antares manager backed by an isolated on-disk Dicfuse store.
     pub async fn new_with_store_path(paths: AntaresPaths, store_path: &str) -> Self {
         let dic = Arc::new(Dicfuse::new_with_store_path(store_path).await);
-        Self::with_dicfuse(paths, dic)
+        Self::with_dicfuse(paths, dic, store_path.to_string())
     }
 
     /// Mount the monorepo root at an auto-generated mountpoint.
@@ -360,7 +367,11 @@ impl AntaresManager {
             .insert(job_id.to_string(), instance.clone());
         self.persist_state().await?;
 
-        let dic = DicfuseManager::for_base_path(&source_path).await;
+        let dic = if source_path == DEFAULT_SOURCE_PATH {
+            self.dic.clone()
+        } else {
+            DicfuseManager::for_base_path_with_store_root(&source_path, &self.store_root).await
+        };
         let store_ready_path = ready_path.as_deref().unwrap_or(DEFAULT_SOURCE_PATH);
         dic.store
             .wait_for_path_ready(
